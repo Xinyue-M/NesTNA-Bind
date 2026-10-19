@@ -1,0 +1,35 @@
+#!/bin/bash
+#PBS -N nestnabind_opt50
+#PBS -q siais_gpu_4
+#PBS -l nodes=1:ppn=4:gpus=1:rtx3090
+#PBS -l mem=32gb
+#PBS -l walltime=12:00:00
+#PBS -S /bin/bash
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit from the repository directory}"
+export PATH="/public/home/maxy2022/anaconda3/envs/pytorch11.2+cu113-py3.7/bin:$PATH"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 PYTHONUNBUFFERED=1
+mkdir -p "logs/pbs_${PBS_JOBID}"
+exec > >(tee "logs/pbs_${PBS_JOBID}/job.log") 2>&1
+trap 'status=$?; printf "\nPBS_TRAIN_EXIT_STATUS=%s\n" "$status"; date' EXIT
+date
+hostname
+if [[ -n "${PBS_GPUFILE:-}" && -s "${PBS_GPUFILE}" ]]; then
+    gpu_allocation=$(head -n 1 "$PBS_GPUFILE")
+    gpu_index=${gpu_allocation##*gpu}
+    export CUDA_VISIBLE_DEVICES=${gpu_index#/}
+elif [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    printf 'PBS GPU assignment is missing\n'
+    exit 1
+fi
+python -u - <<'PY'
+import torch
+assert torch.cuda.is_available(), 'A CUDA GPU is required'
+print('GPU:', torch.cuda.get_device_name(0))
+PY
+python -u train_cv.py --taskname RNA --taskbase site --num_sampling all \
+    --num_neighbors 128 --split_ratio 0.8 --seed 0 --fold 0 --epochs 50 \
+    --checkpoints_dir "logs/pbs_${PBS_JOBID}"
+printf '\nPBS_TRAIN_SUCCESS\n'

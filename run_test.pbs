@@ -1,0 +1,84 @@
+#!/bin/bash
+#PBS -N nestnabind_opt1
+#PBS -q siais_gpu_4
+#PBS -l nodes=1:ppn=4:gpus=1:rtx3090
+#PBS -l mem=32gb
+#PBS -l walltime=01:00:00
+#PBS -S /bin/bash
+#PBS -j oe
+
+set -euo pipefail
+cd "${PBS_O_WORKDIR:?Submit from the repository directory}"
+export PATH="/public/home/maxy2022/anaconda3/envs/pytorch11.2+cu113-py3.7/bin:$PATH"
+export OMP_NUM_THREADS=4 MKL_NUM_THREADS=4 OPENBLAS_NUM_THREADS=4 PYTHONUNBUFFERED=1
+
+test_output="logs/test1_${PBS_JOBID}"
+mkdir -p "$test_output"
+exec > >(tee "$test_output/job.log") 2>&1
+trap 'status=$?; printf "\nPBS_TEST_EXIT_STATUS=%s\n" "$status"; date' EXIT
+date
+hostname
+if [[ -n "${PBS_GPUFILE:-}" && -s "${PBS_GPUFILE}" ]]; then
+    gpu_allocation=$(head -n 1 "$PBS_GPUFILE")
+    gpu_index=${gpu_allocation##*gpu}
+    export CUDA_VISIBLE_DEVICES=${gpu_index#/}
+elif [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    printf 'PBS GPU assignment is missing\n'
+    exit 1
+fi
+printf 'CUDA_VISIBLE_DEVICES=%s\n' "$CUDA_VISIBLE_DEVICES"
+python -u - <<'PY'
+import sys
+import torch
+assert torch.cuda.is_available(), 'A CUDA GPU is required'
+print('Python:', sys.executable)
+print('PyTorch:', torch.__version__, 'CUDA:', torch.version.cuda)
+print('GPU:', torch.cuda.get_device_name(0))
+PY
+
+# Complete data: 528 training, 132 validation, 150 testing proteins.
+python -u train_cv.py --taskname RNA --taskbase site --num_sampling all \
+    --num_neighbors 128 --split_ratio 0.8 --seed 0 --fold 0 --epochs 1 \
+    --checkpoints_dir "$test_output"
+
+# Check the resulting files on the compute node before declaring success.
+python -u - "$test_output" <<'PY'
+import csv
+import json
+import sys
+from pathlib import Path
+import numpy as np
+import torch
+from vit_esm import ViT_ESM
+
+output = Path(sys.argv[1])
+folds = list(output.glob('*/fold_0'))
+assert len(folds) == 1, 'Expected exactly one fold'
+fold = folds[0]
+with (fold / 'out.csv').open() as handle:
+    rows = list(csv.DictReader(handle))
+assert len(rows) == 1 and rows[0]['Epoch'] == '0', 'Expected exactly one epoch'
+with (fold / 'split.json').open() as handle:
+    split = json.load(handle)
+counts = {key: len(value) for key, value in split.items()}
+assert counts == {'train': 528, 'validation': 132, 'test': 150}, counts
+assert not set(split['train']) & set(split['validation'])
+model = ViT_ESM()
+for name in ('Model_Epoch0.pth', 'Bestmodel_Epoch0.pth'):
+    model.load_state_dict(torch.load(str(fold / name), map_location='cpu'))
+    print('Checkpoint reload OK:', name)
+probabilities, labels = torch.load(str(fold / 'Predict_Epoch0.pth'), map_location='cpu')
+assert probabilities.shape == labels.shape and probabilities.size > 0
+assert np.isfinite(probabilities).all()
+assert ((probabilities >= 0) & (probabilities <= 1)).all()
+assert set(np.unique(labels)) == {0, 1}
+result = dict(fold_dir=str(fold.resolve()), split_counts=counts,
+              prediction_count=int(probabilities.size),
+              positive_labels=int(labels.sum()), epoch_metrics=rows[0],
+              checkpoint_reload='passed', status='passed')
+with (output / 'verification.json').open('w') as handle:
+    json.dump(result, handle, indent=2)
+    handle.write('\n')
+print(json.dumps(result, indent=2))
+PY
+printf '\nPBS_OPTIMIZED_TEST_SUCCESS\n'
